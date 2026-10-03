@@ -29,6 +29,14 @@ local TAPE_PLAYING = 2
 local TAPE_PAUSED = 3
 
 local text_editor = include("lib/text_editor")
+local deps = include("lib/deps")
+
+local PIPER_VOICE_URL = "https://huggingface.co/rhasspy/piper-voices"
+  .. "/resolve/main/en/en_GB/alan/low/en_GB-alan-low.onnx"
+local PIPER_ARMV7_URL = "https://github.com/rhasspy/piper/releases/download"
+  .. "/2023.11.14-2/piper_linux_armv7l.tar.gz"
+local PIPER_RUNTIME_DIR = (os.getenv("HOME") or "")
+  .. "/.local/share/piper/runtime"
 local system_textentry = require "textentry"
 local original_textentry_enter
 local custom_textentry_enter
@@ -87,11 +95,60 @@ local status = "K2 preview  K3 save"
 local busy = false
 local job_clock = nil
 local espeak_available = false
+local espeak_range_available = false
 local flite_available = false
 local piper_available = false
 local sox_available = false
 local espeak_voices = { "en" }
 local flite_voices = { "kal" }
+
+-- what the script needs installed; see lib/deps for the spec format
+local speech_deps = deps.new { name = "speech", dir = DATA_DIR .. "deps" }
+speech_deps:add { id = "sox", label = "SoX", check = "sox", pkg = "sox",
+  size = "1 MB", why = "converts renders to 48 kHz WAV" }
+speech_deps:add { id = "espeak", label = "eSpeak NG", check = "espeak-ng",
+  pkg = "espeak-ng", size = "3 MB", why = "formant speech backend" }
+speech_deps:add { id = "flite", label = "flite", check = "flite",
+  pkg = "flite", size = "5 MB", why = "small speech backend" }
+speech_deps:add { id = "pipx", label = "pipx", check = "pipx",
+  pkg = { apt = "pipx", pacman = "python-pipx", dnf = "pipx" },
+  size = "2 MB", why = "installs Python tools" }
+speech_deps:add { id = "piper", label = "Piper", check = "piper",
+  size = "25 MB", why = "neural speech backend",
+  install = {
+    -- the Python wheels do not support 32-bit ARM (norns shield)
+    { when = { arch = "armv7l" }, steps = {
+      { url = PIPER_ARMV7_URL, extract = PIPER_RUNTIME_DIR,
+        sha256 = "c6946fcd57c705ed1d4666ea880f80ba0bbbd14de62ecbdd13460baf3bac8e37",
+        label = "download Piper" },
+      { cmd = "ln -sfn " .. PIPER_RUNTIME_DIR
+          .. "/piper/piper /usr/local/bin/piper",
+        priv = true, label = "link piper" },
+    } },
+    { needs = { "pipx" }, steps = { { pipx = "piper-tts" } } },
+  } }
+speech_deps:add { id = "piper_voice", label = "Piper voice (Alan)",
+  check_file = { DEFAULT_PIPER_MODEL, DEFAULT_PIPER_MODEL .. ".json" },
+  size = "63 MB", why = "default Piper model", install = { { steps = {
+    { url = PIPER_VOICE_URL .. ".json", dest = DEFAULT_PIPER_MODEL .. ".json",
+      sha256 = "c8164cc04b6ce102c651ce4a1e788e8429fa638501fca0723860718d4b44637e",
+      label = "download voice config" },
+    { url = PIPER_VOICE_URL, dest = DEFAULT_PIPER_MODEL,
+      sha256 = "a1f60584620a2bed203de823d08f5abb336fb15f3d6f33f8c341e3e2cabf5dde",
+      label = "download Alan voice" },
+  } } } }
+
+local function install_deps(ids)
+  speech_deps:ensure(ids, { on_done = function(ok, _, did_install)
+    -- availability, voice lists and params are built at init: start over
+    if did_install then
+      clock.run(function()
+        clock.sleep(0.2)
+        norns.script.load(norns.state.script)
+      end)
+    end
+  end })
+end
 
 local function phrase_param_id(index)
   if index == 1 then return PARAM_PREFIX .. "phrase" end
@@ -123,7 +180,8 @@ local function discover_espeak_voices()
   add_unique(voices, seen, "en")
   if not espeak_available then return voices end
 
-  local output = util.os_capture("espeak-ng --voices 2>/dev/null", true)
+  local output = util.os_capture(
+    deps.PATH_EXPORT .. "espeak-ng --voices 2>/dev/null", true)
   for line in (output or ""):gmatch("[^\r\n]+") do
     add_unique(voices, seen, line:match("^%s*%d+%s+(%S+)"))
   end
@@ -136,7 +194,8 @@ local function discover_flite_voices()
   local voices = {}
   local seen = {}
   local found_header = false
-  local output = util.os_capture("flite -lv 2>/dev/null", true)
+  local output = util.os_capture(
+    deps.PATH_EXPORT .. "flite -lv 2>/dev/null", true)
   for token in (output or ""):gmatch("%S+") do
     if found_header then
       add_unique(voices, seen, token)
@@ -229,13 +288,15 @@ local function render_wav(path, tail_seconds)
   local command
   if params:get(PARAM_PREFIX .. "backend") == 1 then
     local voice = params:string(ESPEAK_VOICE_PARAM)
+    local range_option = espeak_range_available
+      and string.format(" -P %d", params:get(PARAM_PREFIX .. "range")) or ""
     command = string.format(
-      "espeak-ng --stdin -v %s -s %d -p %d -P %d"
+      "espeak-ng --stdin -v %s -s %d -p %d%s"
         .. " -a %d -g %d -w %s < %s",
       shell_quote(voice),
       params:get(PARAM_PREFIX .. "speed"),
       params:get(PARAM_PREFIX .. "pitch"),
-      params:get(PARAM_PREFIX .. "range"),
+      range_option,
       params:get(PARAM_PREFIX .. "amplitude"),
       params:get(PARAM_PREFIX .. "word_gap"),
       shell_quote(source_path),
@@ -275,7 +336,7 @@ local function render_wav(path, tail_seconds)
     shell_quote(LOG_FILE)
   )
 
-  local rendered = os.execute(command) == true
+  local rendered = os.execute(deps.PATH_EXPORT .. command) == true
   os.remove(text_path)
   if not rendered or not util.file_exists(temp_path) then
     os.remove(source_path)
@@ -452,6 +513,9 @@ local function backend_changed(backend)
   set_visible(ESPEAK_PARAM_IDS, backend == 1)
   set_visible(FLITE_PARAM_IDS, backend == 2)
   set_visible(PIPER_PARAM_IDS, backend == 3)
+  if not espeak_range_available then
+    params:hide(PARAM_PREFIX .. "range")
+  end
   if _menu and _menu.rebuild_params then _menu.rebuild_params() end
 
   local unavailable = backend_error()
@@ -470,7 +534,7 @@ local function number_with_units(units)
 end
 
 local function add_params()
-  params:add_group(PARAM_PREFIX .. "group", "SPEECH", 19)
+  params:add_group(PARAM_PREFIX .. "group", "SPEECH", 20)
   params:add_option(PARAM_PREFIX .. "backend", "backend", BACKENDS, 1)
   params:set_action(PARAM_PREFIX .. "backend", backend_changed)
   params:add_number(ACTIVE_PHRASE_PARAM, "phrase", 1, PHRASE_COUNT, 1)
@@ -508,6 +572,12 @@ local function add_params()
   params:set_action(PARAM_PREFIX .. "preview", preview)
   params:add_trigger(PARAM_PREFIX .. "save", "save WAV")
   params:set_action(PARAM_PREFIX .. "save", save_wav)
+  params:add_trigger(PARAM_PREFIX .. "install", "install dependencies")
+  params:set_action(PARAM_PREFIX .. "install", function()
+    -- the params menu owns the screen; leave it so the installer is visible
+    norns.menu.toggle(false)
+    install_deps({ "sox", "espeak", "flite", "piper", "piper_voice" })
+  end)
 
   params:add_group(PARAM_PREFIX .. "phrases_group", "PHRASES", PHRASE_COUNT)
   for i = 1, PHRASE_COUNT do
@@ -560,19 +630,33 @@ end
 function init()
   util.make_dir(DATA_DIR)
   util.make_dir(OUTPUT_DIR)
-  espeak_available = os.execute(
-    "command -v espeak-ng >/dev/null 2>&1") == true
-  flite_available = os.execute(
-    "command -v flite >/dev/null 2>&1") == true
-  piper_available = os.execute(
-    "command -v piper >/dev/null 2>&1") == true
-  sox_available = os.execute(
-    "command -v sox >/dev/null 2>&1") == true
+  espeak_available = speech_deps:ok("espeak")
+  espeak_range_available = espeak_available and os.execute(
+    deps.PATH_EXPORT
+      .. "espeak-ng --help 2>&1 | grep -q -- '-P <integer>'") == true
+  if not espeak_range_available then
+    table.remove(ESPEAK_CONTROLS, 3)
+  end
+  flite_available = speech_deps:ok("flite")
+  piper_available = speech_deps:ok("piper")
+  sox_available = speech_deps:ok("sox")
   espeak_voices = discover_espeak_voices()
   flite_voices = discover_flite_voices()
   add_params()
   install_text_editor()
   redraw()
+  -- offer to install what is needed to render anything at all
+  local piper_voice_available = speech_deps:ok("piper_voice")
+  local backend_available = espeak_available or flite_available
+    or (piper_available and piper_voice_available)
+  local missing = {}
+  if not sox_available then missing[#missing + 1] = "sox" end
+  if not backend_available then
+    missing[#missing + 1] = piper_available and "piper_voice" or "espeak"
+  end
+  if #missing > 0 then
+    install_deps(missing)
+  end
 end
 
 function enc(n, delta)

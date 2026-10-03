@@ -12,6 +12,14 @@ sample-based nb voice afterward.
 
 ## Requirements
 
+When SoX or every backend is missing, the script opens an installer screen
+that offers to install them (K3 to install, K2 to cancel). **PARAMETERS >
+SPEECH > install dependencies** opens it later for flite, Piper and the
+default Piper voice. Installing needs root: norns has passwordless sudo, and
+on desktop a graphical password prompt (pkexec) is used. If neither works,
+the screen shows the command to run yourself. The manual steps below do the
+same thing.
+
 Install SoX and at least one speech backend. eSpeak NG and flite are available
 from the norns package repository:
 
@@ -108,8 +116,8 @@ The phrases and output name use the same text editor.
 
 ## Backends
 
-- **eSpeak NG** provides speed, pitch, pitch range, amplitude, and word-gap
-  controls.
+- **eSpeak NG** provides speed, pitch, amplitude, and word-gap controls. Pitch
+  range is also available when supported by the installed eSpeak version.
 - **flite** provides duration-stretch and pitch-shift controls. Stretch values
   above `1.00x` speak more slowly, while lower values speak more quickly. Pitch
   is adjustable by +/-12 semitones.
@@ -119,6 +127,8 @@ The phrases and output name use the same text editor.
 
 Only the active backend's settings are shown in the parameters menu. You only
 need to install the backend you intend to use, plus SoX.
+eSpeak NG is the default for new installs; a pset can select any available
+backend explicitly.
 
 The phrases, active phrase number, and settings are ordinary norns params, so
 they are stored in the script's psets. Saved audio is written separately to:
