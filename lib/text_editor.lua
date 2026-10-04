@@ -20,6 +20,13 @@ local function split_chars(text)
   return chars
 end
 
+-- screen.text_extents measures ink width, which ignores leading/trailing
+-- spaces; bracket the string with a sentinel to get the advance width
+local function text_width(text)
+  if text == "" then return 0 end
+  return screen.text_extents("|" .. text .. "|") - screen.text_extents("||")
+end
+
 local function update()
   if editor.check then editor.warning = editor.check(current_text()) end
   editor.redraw()
@@ -55,7 +62,7 @@ local function wrapped_lines()
       line = { chars = {}, start = i, finish = i }
     else
       local candidate = table.concat(line.chars) .. char
-      if #line.chars > 0 and screen.text_extents(candidate) > 127 then
+      if #line.chars > 0 and text_width(candidate) > 127 then
         local break_at
         for j = #line.chars, 1, -1 do
           if line.chars[j]:match("%s") then
@@ -70,7 +77,7 @@ local function wrapped_lines()
             next_chars[#next_chars + 1] = line.chars[j]
           end
           next_chars[#next_chars + 1] = char
-          if screen.text_extents(table.concat(next_chars)) <= 127 then
+          if text_width(table.concat(next_chars)) <= 127 then
             for j = #line.chars, break_at + 1, -1 do
               table.remove(line.chars, j)
             end
@@ -133,11 +140,15 @@ local function draw_text(max_lines, first_y, spacing)
       for j = 1, math.min(count, #line.chars) do
         prefix[j] = line.chars[j]
       end
-      local width = screen.text_extents(table.concat(prefix))
-      local x = math.min(127, width)
-      screen.move(x, y - 7)
-      screen.line(x, y + 1)
-      screen.stroke()
+      local x = math.min(127, text_width(table.concat(prefix)) + 1)
+      -- blinking bar between characters (block is wrong for a
+      -- proportional font), 50% duty cycle
+      if util.time() % 1 < 0.5 then
+        screen.level(15)
+        screen.move(x, y - 7)
+        screen.line(x, y + 1)
+        screen.stroke()
+      end
     end
   end
 end
