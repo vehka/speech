@@ -93,6 +93,18 @@ function M.detect(overrides)
   return p
 end
 
+-- On a device, restarting sclang and matron needs JACK's shared memory files.
+-- logind can delete them (RemoveIPC) after the last ssh session of the user
+-- closes; jackd keeps running, but nothing new can connect and a restart
+-- ends with norns-main failed until the device is rebooted.
+function M.jack_files_missing(p)
+  if p.desktop then return false end
+  if not (M.run("pgrep -x jackd") or M.run("pgrep -x jackdbus")) then
+    return false
+  end
+  return not M.run("test -e /dev/shm/jack-shm-registry")
+end
+
 -- how a command that needs root is written for the log / for copy-paste
 function M.manual_cmd(p, cmd)
   if p.priv == "root" then return cmd end

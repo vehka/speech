@@ -40,11 +40,17 @@ function M.new(deps, ids)
         item.steps = steps
       else
         item.blocked, item.hint = err, hint
+        -- no recipe for this platform: say how to get it by hand
+        if spec.manual and not hint then item.blocked = spec.manual end
       end
       self.items[#self.items + 1] = item
     end
   end
 
+  if #self.items == 0 and deps:restart_pending() then
+    -- installed earlier, but sclang has not been restarted since
+    self.needs_restart = true
+  end
   if #self.items > 0 then
     self.state = "review"
     self.sel = 1
@@ -122,6 +128,10 @@ function Session:tick()
       if self.deps:check(entry.item.spec) then
         entry.item.ok = true
         self.did_install = true
+        if entry.item.spec.restart then
+          self.needs_restart = true
+          self.deps:mark_restart()
+        end
         self.results[entry.item.spec.id] = true
       else
         r.code = 1

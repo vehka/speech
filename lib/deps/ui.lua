@@ -78,33 +78,85 @@ local function draw_failed(s)
   footer("K2 close", "K3 retry")
 end
 
-local function draw_blocked(s)
-  header(s, "can't install here")
-  local y = 18
+-- word wrap to `cols` characters (the 128 px screen fits about 21)
+local function wrap(str, cols)
+  local lines, line = {}, ""
+  for word in str:gmatch("%S+") do
+    while #word > cols do
+      if line ~= "" then lines[#lines + 1] = line line = "" end
+      lines[#lines + 1] = word:sub(1, cols)
+      word = word:sub(cols + 1)
+    end
+    if line == "" then line = word
+    elseif #line + 1 + #word <= cols then line = line .. " " .. word
+    else lines[#lines + 1] = line line = word end
+  end
+  if line ~= "" then lines[#lines + 1] = line end
+  return lines
+end
+M.wrap = wrap
+
+-- the reason and the command to run by hand for each blocked item, as
+-- screen lines; E2 scrolls when they don't fit
+local function blocked_lines(s)
+  local lines = {}
   for _, item in ipairs(s.items) do
     if item.blocked then
-      text(0, y, trim(item.spec.id .. ": " .. item.blocked, 127), 15)
-      y = y + 8
+      for _, l in ipairs(wrap(item.spec.id .. ": " .. item.blocked, 21)) do
+        lines[#lines + 1] = { l, 15 }
+      end
       if item.hint then
-        text(0, y, trim(item.hint, 127), 6)
-        y = y + 8
+        for _, l in ipairs(wrap(item.hint, 21)) do
+          lines[#lines + 1] = { l, 6 }
+        end
       end
     end
   end
-  footer(nil, "K2 close")
+  return lines
+end
+
+local function draw_blocked(s)
+  header(s, "blocked")
+  local lines = blocked_lines(s)
+  local first = math.max(0, math.min(s.scroll or 0, #lines - 5))
+  for row = 1, 5 do
+    local line = lines[first + row]
+    if line then text(0, 17 + (row - 1) * 8, line[1], line[2]) end
+  end
+  footer(#lines > 5 and "E2 scroll" or nil, "K2 close")
 end
 
 local function draw_done(s)
-  header(s, "ready")
-  screen.level(15)
-  screen.move(64, 36)
-  screen.text_center("all dependencies")
-  screen.move(64, 46)
-  screen.text_center("in place")
-  footer(nil, "K3 ok")
+  if s.needs_restart then
+    header(s, "restart needed")
+    screen.level(15)
+    screen.move(64, 30)
+    screen.text_center("installed. restart to")
+    screen.move(64, 40)
+    screen.text_center("load the new UGens")
+    footer("K2 later", "K3 restart")
+  else
+    header(s, "ready")
+    screen.level(15)
+    screen.move(64, 36)
+    screen.text_center("all dependencies")
+    screen.move(64, 46)
+    screen.text_center("in place")
+    footer(nil, "K3 ok")
+  end
+end
+
+local function draw_reboot(s)
+  header(s, "reboot needed")
+  for i, line in ipairs(wrap("JACK's files are gone, "
+      .. "usually after an ssh logout. Reboot the device instead.", 21)) do
+    text(0, 17 + (i - 1) * 9, line, 15)
+  end
+  footer("K2 later", "K3 reboot")
 end
 
 local drawers = {
+  reboot = draw_reboot,
   review = draw_review, running = draw_running, failed = draw_failed,
   blocked = draw_blocked, done = draw_done,
 }
@@ -129,8 +181,23 @@ function M.key(s, n, z)
     if n == 3 then s:retry() end
   elseif s.state == "blocked" then
     if n == 2 or n == 3 then return true end
+  elseif s.state == "reboot" then
+    if n == 3 then s.deps.reboot() return true end
+    if n == 2 then return true end
   elseif s.state == "done" then
-    if n >= 2 then return true end
+    if s.needs_restart then
+      if n == 3 then
+        if s.deps:jack_files_missing() then
+          s.state = "reboot"
+        else
+          s.deps.restart()
+          return true
+        end
+      end
+      if n == 2 then return true end
+    elseif n >= 2 then
+      return true
+    end
   end
   return false
 end
@@ -141,6 +208,8 @@ function M.enc(s, n, d)
     s.sel = math.max(1, math.min(#s.items, s.sel + d))
   elseif s.state == "failed" then
     s.scroll = math.max(0, s.scroll - d)
+  elseif s.state == "blocked" then
+    s.scroll = math.max(0, (s.scroll or 0) + d)
   end
 end
 

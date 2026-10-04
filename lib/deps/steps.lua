@@ -53,8 +53,11 @@ function builders.pkg(spec, p)
   elseif p.pm == "dnf" then
     cmd = "dnf install -y " .. list
   end
+  local manual = ({
+    apt = "apt install ", pacman = "pacman -S ", dnf = "dnf install ",
+  })[p.pm] .. list
   return { label = p.pm .. ": " .. list, cmd = cmd, priv = true,
-           progress = progress }
+           progress = progress, manual = manual }
 end
 
 function builders.pipx(spec, p)
@@ -113,10 +116,9 @@ function M.build(spec, p, ctx)
       local step, err = builders[kind](spec, p, ctx)
       if not step then return nil, err end
       if step.priv then
-        step.hint = platform.manual_cmd(p, step.cmd)
+        step.hint = platform.manual_cmd(p, step.manual or step.cmd)
         if not p.priv then
-          return nil, "needs root, but sudo is not available"
-            .. " without a password", step.hint
+          return nil, "needs root; sudo asks for a password", step.hint
         end
         step.run = platform.wrap_priv(p, step.cmd)
       else

@@ -122,6 +122,52 @@ function Deps:ugen_conflicts(names)
   return ugens.duplicates(self.platform, names)
 end
 
+-- Restart tracking. A dependency with `restart = true` (new UGens, classes)
+-- is only usable after sclang has been restarted. The install time goes in a
+-- marker file; it is stale when sclang started before it.
+function Deps:marker_path()
+  return self.dir .. "/restart_needed"
+end
+
+function Deps:mark_restart()
+  local f = io.open(self:marker_path(), "w")
+  if f then f:write(tostring(os.time())) f:close() end
+end
+
+-- seconds sclang has been running, nil when it isn't
+function Deps.sclang_uptime()
+  local pid = platform.capture("pgrep -x sclang | head -n 1")
+  if pid == "" then return nil end
+  return tonumber(platform.capture("ps -o etimes= -p " .. pid))
+end
+
+function Deps:restart_pending()
+  local f = io.open(self:marker_path(), "r")
+  if not f then return false end
+  local installed = tonumber(f:read("a"))
+  f:close()
+  local uptime = self.sclang_uptime()
+  return installed ~= nil and uptime ~= nil and installed > os.time() - uptime
+end
+
+function Deps:jack_files_missing()
+  return platform.jack_files_missing(self.platform)
+end
+
+-- reboot the device (a restart can't recover from missing JACK files)
+function Deps.reboot()
+  if norns and norns.state then
+    norns.state.clean_shutdown = true
+    norns.state.save()
+  end
+  if _norns and _norns.execute then _norns.execute("sudo shutdown -r now") end
+end
+
+-- restart sclang and matron (what SYSTEM > RESTART does at its end)
+function Deps.restart()
+  if _norns and _norns.reset then _norns.reset() end
+end
+
 -- ids plus everything they `need`, dependencies first, no repeats
 function Deps:expand(ids)
   local out, seen = {}, {}
@@ -149,16 +195,18 @@ end
 
 -- Open the install screen. Takes over key/enc/redraw until it closes, then
 -- puts the script's own handlers back and calls
--- opts.on_done(ok, results, did_install).
+-- opts.on_done(ok, results, did_install, needs_restart).
 -- Does nothing (calls on_done at once) when everything is already in place.
 function Deps:ensure(ids, opts)
   opts = opts or {}
   local s = self:session(ids)
   local function finish()
     local ok = s:ok()
-    if opts.on_done then opts.on_done(ok, s.results, s.did_install) end
+    if opts.on_done then
+      opts.on_done(ok, s.results, s.did_install, s.needs_restart)
+    end
   end
-  if s.state == "done" then return finish() end
+  if s.state == "done" and not s.needs_restart then return finish() end
 
   local running = true
   local menu_active = norns.menu.status()
