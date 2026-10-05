@@ -14,7 +14,9 @@ end
 -- synchronous capture; norns' sidecar-backed helper when we have it
 function M.capture(cmd)
   if util and util.os_capture then
-    return (util.os_capture(cmd .. " 2>/dev/null", true) or ""):gsub("%s+$", "")
+    -- parentheses: only the string, not gsub's count
+    return ((util.os_capture(cmd .. " 2>/dev/null", true) or "")
+      :gsub("%s+$", ""))
   end
   local f = io.popen(cmd .. " 2>/dev/null")
   if not f then return "" end

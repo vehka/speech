@@ -4,12 +4,14 @@
 --   { pkg = "name" | { apt = "...", pacman = "...", dnf = "..." } }
 --   { pipx = "package" }
 --   { url = "...", dest = "path", sha256 = "...", extract = "dir" }
+--   { ugens = "url", into = "folder", sha256 = "..." }
 --   { cmd = "shell", priv = true, label = "..." }
 --
 -- build() returns { label, cmd, progress, priv, hint } or nil, reason.
 
 local req = ...
 local platform = req("platform")
+local ugens = req("ugens")
 local q = platform.shell_quote
 
 local M = {}
@@ -64,42 +66,119 @@ function builders.pipx(spec, p)
   return { label = "pipx: " .. spec.pipx, cmd = "pipx install " .. spec.pipx }
 end
 
-function builders.url(spec, p, ctx)
-  local dest = spec.dest and expand(p, spec.dest)
-    or (ctx.dir .. "/downloads/" .. basename(spec.url))
+-- "{arch}" in a URL becomes the machine name (armv7l, aarch64, x86_64);
+-- sha256 may be one checksum or a table of them by arch. A table without
+-- this arch means there is no download for it.
+local function resolve(spec, p, url)
+  local sum = spec.sha256
+  if type(sum) == "table" then
+    sum = sum[p.arch]
+    if not sum then return nil, "no download for " .. tostring(p.arch) end
+  end
+  return (url:gsub("{arch}", p.arch or "")), sum
+end
+
+-- commands that download url to dest (resuming a partial file) and verify it
+local function fetch(url, sum, dest)
   local part = dest .. ".part"
   local dir = dest:match("^(.*)/[^/]*$") or "."
 
   local dl
   if platform.have("wget") then
     dl = "wget -c -t 3 --timeout=20 --progress=dot:mega -O "
-      .. q(part) .. " " .. q(spec.url)
+      .. q(part) .. " " .. q(url)
   elseif platform.have("curl") then
     dl = "curl -fL --retry 3 --connect-timeout 20 -C - -# -o "
-      .. q(part) .. " " .. q(spec.url)
+      .. q(part) .. " " .. q(url)
   else
     return nil, "neither wget nor curl is installed"
   end
 
   local cmd = { "mkdir -p " .. q(dir), dl }
-  if spec.sha256 then
-    cmd[#cmd + 1] = "echo " .. q(spec.sha256 .. "  " .. part)
-      .. " | sha256sum -c -"
+  if sum then
+    cmd[#cmd + 1] = "echo " .. q(sum .. "  " .. part) .. " | sha256sum -c -"
   end
   cmd[#cmd + 1] = "mv " .. q(part) .. " " .. q(dest)
+  return cmd
+end
+
+local function unpack_cmd(file, out)
+  if file:match("%.zip$") then
+    return "unzip -oq " .. q(file) .. " -d " .. out
+  end
+  return "tar -xf " .. q(file) .. " -C " .. out
+end
+
+function builders.url(spec, p, ctx)
+  local url, sum = resolve(spec, p, spec.url)
+  if not url then return nil, sum end
+  local dest = spec.dest and expand(p, spec.dest)
+    or (ctx.dir .. "/downloads/" .. basename(url))
+  local cmd, err = fetch(url, sum, dest)
+  if not cmd then return nil, err end
   if spec.extract then
     local out = expand(p, spec.extract)
     cmd[#cmd + 1] = "mkdir -p " .. q(out)
-    if dest:match("%.zip$") then
-      cmd[#cmd + 1] = "unzip -oq " .. q(dest) .. " -d " .. q(out)
-    else
-      cmd[#cmd + 1] = "tar -xf " .. q(dest) .. " -C " .. q(out)
-    end
+    cmd[#cmd + 1] = unpack_cmd(dest, q(out))
     if not spec.dest then cmd[#cmd + 1] = "rm -f " .. q(dest) end
   end
   return {
-    label = spec.label or ("download " .. basename(spec.url)),
+    label = spec.label or ("download " .. basename(url)),
     cmd = table.concat(cmd, " && "),
+    progress = "percent",
+  }
+end
+
+-- Prebuilt UGens: an archive (or a single .so/.scx/.sc) whose contents go to
+-- Extensions/<into>. A file SuperCollider already finds somewhere else is
+-- left out, since a second copy stops sclang compiling (classes) or makes
+-- scsynth complain (plugins). Unpacked in /tmp first: on norns the download
+-- directory is under dust, where sclang compiles every class file it sees.
+function builders.ugens(spec, p, ctx)
+  local into = spec.into
+  if type(into) ~= "string" or not into:match("^[%w_][%w_.-]*$") then
+    return nil, "ugens step needs `into`, a folder name"
+  end
+  local url, sum = resolve(spec, p, spec.ugens)
+  if not url then return nil, sum end
+  local file = ctx.dir .. "/downloads/" .. basename(url)
+  local cmd, err = fetch(url, sum, file)
+  if not cmd then return nil, err end
+
+  local dest = ugens.user_dir(p) .. "/" .. into
+  local function find_other(roots)
+    local dirs = {}
+    for _, root in ipairs(roots) do dirs[#dirs + 1] = q(root) end
+    return "find " .. table.concat(dirs, " ") .. ' -name "$n" -type f'
+      .. " -not -path " .. q(dest .. "/*") .. " -not -path '*/.git/*'"
+      .. " 2>/dev/null | head -n 1"
+  end
+  local single = file:match("%.so$") or file:match("%.scx?$")
+  local script = {
+    table.concat(cmd, " && ") .. " || exit 1",
+    "stage=$(mktemp -d) || exit 1",
+    "trap 'rm -rf \"$stage\" \"$stage.list\"' EXIT",
+    (single and ("cp " .. q(file) .. ' "$stage/"') or unpack_cmd(file, '"$stage"'))
+      .. " || exit 1",
+    'find "$stage" -type f \\( ' .. ugens.FIND_NAMES .. ' \\) > "$stage.list"',
+    "while read -r f; do",
+    '  n=${f##*/}',
+    '  case "$n" in',
+    "    *.sc) hit=$(" .. find_other(ugens.class_roots(p)) .. ") ;;",
+    "    *) hit=$(" .. find_other(ugens.plugin_roots(p)) .. ") ;;",
+    "  esac",
+    '  if [ -n "$hit" ]; then',
+    '    echo "skipped $n: already at $hit"',
+    '    rm -f "$f"',
+    "  fi",
+    'done < "$stage.list"',
+    "mkdir -p " .. q(dest) .. ' && cp -R "$stage"/. ' .. q(dest) .. "/ || exit 1",
+    "rm -f " .. q(file),
+    "echo installed in " .. q(dest),
+  }
+  return {
+    label = spec.label or ("UGens: " .. basename(url)),
+    cmd = table.concat(script, "\n"),
     progress = "percent",
   }
 end
@@ -111,7 +190,7 @@ function builders.cmd(spec, p)
 end
 
 function M.build(spec, p, ctx)
-  for _, kind in ipairs { "pkg", "pipx", "url", "cmd" } do
+  for _, kind in ipairs { "pkg", "pipx", "ugens", "url", "cmd" } do
     if spec[kind] then
       local step, err = builders[kind](spec, p, ctx)
       if not step then return nil, err end

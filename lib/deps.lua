@@ -52,12 +52,23 @@ local function normalize(spec)
   if not spec.install then
     local step = {}
     for _, k in ipairs { "pkg", "pipx", "url", "dest", "sha256", "extract",
-                         "cmd", "priv", "step_label", "progress" } do
+                         "ugens", "into", "cmd", "priv", "step_label",
+                         "progress" } do
       step[k] = spec[k]
     end
     if next(step) then spec.install = { { steps = { step } } } end
   end
   spec.install = spec.install or {}
+  -- UGens go in a folder named after the dependency, and sclang has to be
+  -- restarted before it sees them
+  for _, recipe in ipairs(spec.install) do
+    for _, step in ipairs(recipe.steps or {}) do
+      if step.ugens then
+        step.into = step.into or spec.id
+        if spec.restart == nil then spec.restart = true end
+      end
+    end
+  end
   return spec
 end
 

@@ -1,4 +1,4 @@
--- ugens.lua: find duplicate UGen plugins and class files on the SC class path.
+-- ugens.lua: find UGen plugins and class files where SuperCollider looks.
 --
 -- sclang refuses to compile when the same class is defined twice, and
 -- scsynth warns about duplicate plugins. This is easy to cause by installing
@@ -25,19 +25,69 @@ local function sclang_include_paths(home)
   return paths
 end
 
-function M.roots(p)
-  local roots = {
-    p.home .. "/.local/share/SuperCollider/Extensions",
+function M.user_dir(p)
+  return p.home .. "/.local/share/SuperCollider/Extensions"
+end
+
+local function extension_dirs(p)
+  return {
+    M.user_dir(p),
     "/usr/local/share/SuperCollider/Extensions",
     "/usr/share/SuperCollider/Extensions",
   }
+end
+
+-- where scsynth loads plugins (*.so, *.scx) from
+function M.plugin_roots(p)
+  local roots = extension_dirs(p)
+  roots[#roots + 1] = "/usr/local/lib/SuperCollider/plugins"
+  roots[#roots + 1] = "/usr/lib/SuperCollider/plugins"
+  return roots
+end
+
+-- where sclang compiles class files from; on norns the include paths cover
+-- all of dust
+function M.class_roots(p)
+  local roots = extension_dirs(p)
   for _, path in ipairs(sclang_include_paths(p.home)) do
     roots[#roots + 1] = path
   end
   return roots
 end
 
--- { ["MiPlaits.scx"] = { "/a/MiPlaits.scx", "/b/MiPlaits.scx" }, ... }
+function M.is_plugin(name)
+  return name:match("%.so$") ~= nil or name:match("%.scx$") ~= nil
+end
+
+-- the directories that matter for a file of this name
+function M.roots_for(p, name)
+  return M.is_plugin(name) and M.plugin_roots(p) or M.class_roots(p)
+end
+
+function M.roots(p)
+  local roots, seen = {}, {}
+  for _, list in ipairs { M.plugin_roots(p), M.class_roots(p) } do
+    for _, root in ipairs(list) do
+      if not seen[root] then
+        seen[root] = true
+        roots[#roots + 1] = root
+      end
+    end
+  end
+  return roots
+end
+
+local function under(path, roots)
+  for _, root in ipairs(roots) do
+    if path:sub(1, #root + 1) == root .. "/" then return true end
+  end
+  return false
+end
+
+-- find(1) tests for plugin and class files
+M.FIND_NAMES = "-name '*.so' -o -name '*.scx' -o -name '[A-Z]*.sc'"
+
+-- { ["MiPlaits.so"] = { "/a/MiPlaits.so", "/b/MiPlaits.so" }, ... }
 -- Only names found in more than one place. `names` limits the search.
 function M.duplicates(p, names)
   local dirs = {}
@@ -49,12 +99,12 @@ function M.duplicates(p, names)
   local found, seen = {}, {}
   local out = platform.capture(
     "find " .. table.concat(dirs, " ")
-    .. " \\( -name '*.scx' -o -name '[A-Z]*.sc' \\)"
+    .. " \\( " .. M.FIND_NAMES .. " \\)"
     .. " -not -path '*/.git/*' -type f")
   for path in out:gmatch("[^\n]+") do
-    if not seen[path] then
+    local name = path:match("([^/]+)$")
+    if not seen[path] and under(path, M.roots_for(p, name)) then
       seen[path] = true
-      local name = path:match("([^/]+)$")
       found[name] = found[name] or {}
       table.insert(found[name], path)
     end
@@ -72,12 +122,18 @@ function M.duplicates(p, names)
   return dups
 end
 
--- is a named plugin/class file installed anywhere on the path?
+-- is a named plugin/class file installed where SuperCollider finds it?
+-- A name without an extension is a plugin: "MiPlaits" finds MiPlaits.so
+-- (or .scx).
 function M.installed(p, name)
-  local roots = {}
-  for _, root in ipairs(M.roots(p)) do roots[#roots + 1] = q(root) end
+  local names = { name }
+  if not name:find(".", 1, true) then names = { name .. ".so", name .. ".scx" } end
+  local roots, tests = {}, {}
+  for _, root in ipairs(M.roots_for(p, names[1])) do roots[#roots + 1] = q(root) end
+  for _, n in ipairs(names) do tests[#tests + 1] = "-name " .. q(n) end
   local out = platform.capture("find " .. table.concat(roots, " ")
-    .. " -name " .. q(name) .. " -type f 2>/dev/null | head -n 1")
+    .. " \\( " .. table.concat(tests, " -o ") .. " \\)"
+    .. " -type f 2>/dev/null | head -n 1")
   return out ~= ""
 end
 
