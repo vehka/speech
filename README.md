@@ -116,8 +116,12 @@ The phrases and output name use the same text editor.
 
 ## Backends
 
-- **eSpeak NG** provides speed, pitch, amplitude, and word-gap controls. Pitch
-  range is also available when supported by the installed eSpeak version.
+- **eSpeak NG** provides speed, pitch, pitch range, amplitude, and word-gap
+  controls. A pitch range of 0 removes the intonation; 50 is the normal amount.
+  **monotone** speaks the whole phrase on the note chosen with **monotone
+  note** (E1 to E5), for pitch-correcting or playing the sample chromatically
+  afterward. It replaces the pitch and pitch range settings, turns off
+  eSpeak's pitch flutter, and works with the English (`en...`) voices only.
 - **flite** provides duration-stretch and pitch-shift controls. Stretch values
   above `1.00x` speak more slowly, while lower values speak more quickly. Pitch
   is adjustable by +/-12 semitones.
@@ -141,6 +145,9 @@ they are stored in the script's psets. Saved audio is written separately to:
 
 - Parameter changes affect the next K2/K3 render, not speech already playing.
 - The initial eSpeak speech rate is 120 WPM.
+- Monotone renders stay within a few cents of the chosen note. eSpeak's flat
+  voice is set in whole Hz, so SoX retunes the remainder; this changes the
+  length by under 1%.
 - Output is resampled to norns' 48 kHz audio rate before previewing or saving.
 - Preview files receive a short silent tail to work around norns tape playback
   dropping its final buffered audio. This padding is not added to saved WAVs.

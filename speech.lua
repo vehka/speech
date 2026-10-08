@@ -24,10 +24,18 @@ local FLITE_VOICE_PARAM = PARAM_PREFIX .. "flite_voice_option"
 local PIPER_MODEL_PARAM = PARAM_PREFIX .. "piper_model"
 local DEFAULT_PIPER_MODEL = (os.getenv("HOME") or "")
   .. "/.local/share/piper/voices/en_GB-alan-low.onnx"
+-- monotone speech: a private eSpeak data directory holding a flat variant
+local ESPEAK_DIR = DATA_DIR .. "espeak"
+local MONOTONE_VARIANT = "speechmono"
+-- a variant "pitch N N" line speaks at N - 9 Hz when -p is 50
+local MONOTONE_PITCH_OFFSET = 9
+local MONOTONE_PARAM = PARAM_PREFIX .. "monotone"
+local NOTE_PARAM = PARAM_PREFIX .. "note"
 local TAPE_READY = 1
 local TAPE_PLAYING = 2
 local TAPE_PAUSED = 3
 
+local musicutil = require "musicutil"
 local text_editor = include("lib/text_editor")
 local deps = include("lib/deps")
 
@@ -52,6 +60,8 @@ local ESPEAK_CONTROLS = {
   { id = PARAM_PREFIX .. "speed", name = "speed" },
   { id = PARAM_PREFIX .. "pitch", name = "pitch" },
   { id = PARAM_PREFIX .. "range", name = "pitch range" },
+  { id = MONOTONE_PARAM, name = "monotone" },
+  { id = NOTE_PARAM, name = "monotone note" },
   { id = PARAM_PREFIX .. "amplitude", name = "amplitude" },
   { id = PARAM_PREFIX .. "word_gap", name = "word gap" },
 }
@@ -72,6 +82,8 @@ local ESPEAK_PARAM_IDS = {
   PARAM_PREFIX .. "speed",
   PARAM_PREFIX .. "pitch",
   PARAM_PREFIX .. "range",
+  MONOTONE_PARAM,
+  NOTE_PARAM,
   PARAM_PREFIX .. "amplitude",
   PARAM_PREFIX .. "word_gap",
 }
@@ -95,7 +107,7 @@ local status = "K2 preview  K3 save"
 local busy = false
 local job_clock = nil
 local espeak_available = false
-local espeak_range_available = false
+local espeak_data_linked = false
 local flite_available = false
 local piper_available = false
 local sox_available = false
@@ -257,6 +269,43 @@ local function backend_error()
   end
 end
 
+-- eSpeak loads voice variants only from its data directory, so the flat
+-- variant goes into a copy of the system one made of symlinks
+local function prepare_monotone_voice(pitch)
+  local data = ESPEAK_DIR .. "/espeak-ng-data"
+  if not espeak_data_linked then
+    local version = util.os_capture(
+      deps.PATH_EXPORT .. "espeak-ng --version 2>/dev/null", true)
+    local system_data = (version or ""):match("Data at:%s*([^\r\n]+)")
+    if not system_data then return false, "eSpeak data not found" end
+    local source = shell_quote((system_data:gsub("%s+$", "")))
+    local target = shell_quote(data)
+    espeak_data_linked = os.execute(string.format(
+      "{ mkdir -p %s/voices/'!v'"
+        .. " && for f in %s/*; do [ \"${f##*/}\" = voices ]"
+        .. " || ln -sfn \"$f\" %s/; done"
+        .. " && for f in %s/voices/*; do [ \"${f##*/}\" = '!v' ]"
+        .. " || ln -sfn \"$f\" %s/voices/; done"
+        .. " && ln -sfn %s/voices/'!v'/* %s/voices/'!v'/; } >>%s 2>&1",
+      target, source, target, source, target, source, target,
+      shell_quote(LOG_FILE))) == true
+    if not espeak_data_linked then
+      return false, "monotone setup failed; see data log"
+    end
+  end
+
+  local file, open_error = io.open(
+    data .. "/voices/!v/" .. MONOTONE_VARIANT, "w")
+  if not file then
+    return false, open_error or "could not write monotone voice"
+  end
+  file:write(string.format(
+    "language variant\nname %s\nflutter 0\npitch %d %d\n",
+    MONOTONE_VARIANT, pitch, pitch))
+  file:close()
+  return true
+end
+
 local function render_wav(path, tail_seconds)
   local unavailable = backend_error()
   if unavailable then return false, unavailable end
@@ -264,6 +313,31 @@ local function render_wav(path, tail_seconds)
   local phrase = active_phrase()
   if phrase:match("^%s*$") then
     return false, "phrase is empty"
+  end
+
+  local backend = params:get(PARAM_PREFIX .. "backend")
+  local espeak_voice = params:string(ESPEAK_VOICE_PARAM)
+  local espeak_pitch = params:get(PARAM_PREFIX .. "pitch")
+  local espeak_path = ""
+  local tune_effect = ""
+  if backend == 1 and params:get(MONOTONE_PARAM) == 2 then
+    if not espeak_voice:match("^en") then
+      return false, "monotone: English voices only"
+    end
+    local hz = musicutil.note_num_to_freq(params:get(NOTE_PARAM))
+    local variant_pitch = util.round(hz) + MONOTONE_PITCH_OFFSET
+    local prepared, prepare_error = prepare_monotone_voice(variant_pitch)
+    if not prepared then return false, prepare_error end
+    espeak_voice = espeak_voice .. "+" .. MONOTONE_VARIANT
+    espeak_pitch = 50
+    espeak_path = " --path=" .. shell_quote(ESPEAK_DIR)
+    -- the variant pitch is in whole Hz; retune the remainder
+    tune_effect = string.format(" speed %.2fc",
+      1200 * math.log(hz / util.round(hz)) / math.log(2))
+  elseif backend == 1 then
+    -- embedded pitch range command; unlike -P it works in eSpeak NG 1.50
+    phrase = string.format("\1%dR", params:get(PARAM_PREFIX .. "range"))
+      .. phrase
   end
 
   local path_stem = path:gsub("%.wav$", "")
@@ -286,23 +360,20 @@ local function render_wav(path, tail_seconds)
   end
 
   local command
-  if params:get(PARAM_PREFIX .. "backend") == 1 then
-    local voice = params:string(ESPEAK_VOICE_PARAM)
-    local range_option = espeak_range_available
-      and string.format(" -P %d", params:get(PARAM_PREFIX .. "range")) or ""
+  if backend == 1 then
     command = string.format(
-      "espeak-ng --stdin -v %s -s %d -p %d%s"
+      "espeak-ng --stdin%s -v %s -s %d -p %d"
         .. " -a %d -g %d -w %s < %s",
-      shell_quote(voice),
+      espeak_path,
+      shell_quote(espeak_voice),
       params:get(PARAM_PREFIX .. "speed"),
-      params:get(PARAM_PREFIX .. "pitch"),
-      range_option,
+      espeak_pitch,
       params:get(PARAM_PREFIX .. "amplitude"),
       params:get(PARAM_PREFIX .. "word_gap"),
       shell_quote(source_path),
       shell_quote(text_path)
     )
-  elseif params:get(PARAM_PREFIX .. "backend") == 2 then
+  elseif backend == 2 then
     local voice = params:string(FLITE_VOICE_PARAM)
     command = string.format(
       "flite --setf duration_stretch=%.2f --setf f0_shift=%.4f"
@@ -328,10 +399,11 @@ local function render_wav(path, tail_seconds)
   local tail_effect = tail_seconds
       and string.format(" pad 0 %.2f", tail_seconds) or ""
   command = command .. string.format(
-    " >>%s 2>&1 && sox -G %s -r 48000 %s%s >>%s 2>&1",
+    " >>%s 2>&1 && sox -G %s -r 48000 %s%s%s >>%s 2>&1",
     shell_quote(LOG_FILE),
     shell_quote(source_path),
     shell_quote(temp_path),
+    tune_effect,
     tail_effect,
     shell_quote(LOG_FILE)
   )
@@ -513,9 +585,6 @@ local function backend_changed(backend)
   set_visible(ESPEAK_PARAM_IDS, backend == 1)
   set_visible(FLITE_PARAM_IDS, backend == 2)
   set_visible(PIPER_PARAM_IDS, backend == 3)
-  if not espeak_range_available then
-    params:hide(PARAM_PREFIX .. "range")
-  end
   if _menu and _menu.rebuild_params then _menu.rebuild_params() end
 
   local unavailable = backend_error()
@@ -534,7 +603,7 @@ local function number_with_units(units)
 end
 
 local function add_params()
-  params:add_group(PARAM_PREFIX .. "group", "SPEECH", 20)
+  params:add_group(PARAM_PREFIX .. "group", "SPEECH", 22)
   params:add_option(PARAM_PREFIX .. "backend", "backend", BACKENDS, 1)
   params:set_action(PARAM_PREFIX .. "backend", backend_changed)
   params:add_number(ACTIVE_PHRASE_PARAM, "phrase", 1, PHRASE_COUNT, 1)
@@ -546,6 +615,9 @@ local function add_params()
     number_with_units(" wpm"))
   params:add_number(PARAM_PREFIX .. "pitch", "pitch", 0, 99, 50)
   params:add_number(PARAM_PREFIX .. "range", "pitch range", 0, 99, 50)
+  params:add_option(MONOTONE_PARAM, "monotone", { "off", "on" }, 1)
+  params:add_number(NOTE_PARAM, "monotone note", 28, 76, 45,
+    function(param) return musicutil.note_num_to_name(param:get(), true) end)
   params:add_number(PARAM_PREFIX .. "amplitude", "amplitude", 0, 200, 100)
   params:add_number(PARAM_PREFIX .. "word_gap", "word gap", 0, 100, 0,
     function(param) return (param:get() * 10) .. " ms" end)
@@ -631,12 +703,6 @@ function init()
   util.make_dir(DATA_DIR)
   util.make_dir(OUTPUT_DIR)
   espeak_available = speech_deps:ok("espeak")
-  espeak_range_available = espeak_available and os.execute(
-    deps.PATH_EXPORT
-      .. "espeak-ng --help 2>&1 | grep -q -- '-P <integer>'") == true
-  if not espeak_range_available then
-    table.remove(ESPEAK_CONTROLS, 3)
-  end
   flite_available = speech_deps:ok("flite")
   piper_available = speech_deps:ok("piper")
   sox_available = speech_deps:ok("sox")
